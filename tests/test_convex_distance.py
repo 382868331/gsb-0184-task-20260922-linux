@@ -333,6 +333,31 @@ class TestBudgetAndStatus(unittest.TestCase):
             distance([(0, 0, 0)], [(1, 0, 0)], max_iter=129)
 
 
+class TestNearContactRegression(unittest.TestCase):
+    """Regression tests for two core defects exposed by the sweep work:
+    near-touching pairs (~1e-9 * scale) were misreported as intersecting
+    through the barycentric feasibility slack, and a support point
+    repeating after being dropped from the simplex sent GJK into a
+    cycle that burned the whole iteration budget (false not_converged).
+    """
+
+    def test_near_touch_is_separated_not_intersecting(self):
+        # point 2e-9 above the top face of the unit cube: well above the
+        # zero threshold (~1.7e-11) but inside the old barycentric slack
+        cube = box_corners((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
+        res = distance(cube, [(0.5, 1.0 + 2e-9, 0.0)])
+        self.assertEqual(res.status, STATUS_SEPARATED)
+        self.assertAlmostEqual(res.distance, 2e-9, delta=1e-13)
+
+    def test_support_cycle_terminates(self):
+        # this exact configuration previously exhausted max_iter=128
+        cube = box_corners((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
+        res = distance(cube, [(0.999999, 1.000001, 0.0)])
+        self.assertEqual(res.status, STATUS_SEPARATED)
+        self.assertAlmostEqual(res.distance, 1.000001e-6, delta=2e-12)
+        self.assertLess(res.iterations, 128)
+
+
 class TestValidation(unittest.TestCase):
     def test_nan_and_inf_rejected(self):
         with self.assertRaisesRegex(InputError, r"A\[0\]\[2\]"):
