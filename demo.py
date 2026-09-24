@@ -1,84 +1,112 @@
-"""Deterministic offline demo for the convex_distance module.
+"""Deterministic offline demo for the translational sweep.
 
-Runs three real computations (no sleeps, no prerecorded output):
-  1. a separated pair of convex hulls -> prints the separation certificate
-     and verifies it against every input vertex;
-  2. degenerate lower-dimensional inputs (segment vs triangle) handled by
-     dimension reduction;
-  3. contract violations (NaN coordinate, too many points) actually
-     triggering InputError rejections.
+Runs real sweep_contact computations (no sleeps, no prerecorded output):
+  1. a head-on impact with entry/exit times and a reviewable contact
+     certificate (normal and meeting point);
+  2. boundary cases: grazing single-instant contact, initial overlap
+     with an analytic exit, relative rest, and a complete miss;
+  3. contract violations (2-component velocity, inverted time window,
+     non-finite time) actually triggering InputError.
+
+Expected hand-computed values are printed alongside the results.
 """
 
-import random
+from convex_distance import InputError, sweep_contact
 
-from convex_distance import InputError, distance
+
+def box(lo, hi):
+    return [(x, y, z)
+            for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+            for z in (lo[2], hi[2])]
 
 
 def fmt(p):
     return "(" + ", ".join(f"{c:+.6f}" for c in p) + ")"
 
 
-def dot(u, v):
-    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+def show(title, res, expected=None):
+    print(f"--- {title}")
+    print(f"    status         : {res.status}"
+          + (f"   (expected {expected})" if expected else ""))
+    print(f"    interval       : {res.interval}")
+    print(f"    initial state  : {res.initial_state}"
+          f"   relative rest: {res.relative_rest}")
+    if res.first_contact is not None:
+        c = res.first_contact
+        print(f"    first contact  : t={c.time:.9f}  kind={c.kind}")
+        print(f"                     point={fmt(c.point_a)}"
+              f"  normal={fmt(c.normal) if c.normal else None}")
+    if res.last_contact is not None and (
+            res.first_contact is None
+            or res.last_contact.time != res.first_contact.time
+            or res.last_contact.kind != res.first_contact.kind):
+        c = res.last_contact
+        print(f"    last contact   : t={c.time:.9f}  kind={c.kind}")
+    print(f"    min separation : {res.closest_distance:.3e}"
+          f" at t={res.closest_time:.6f}   GJK iterations: {res.iterations}")
+    print()
 
 
 def main():
-    rng = random.Random(20260922)  # deterministic sample data
+    cube = box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    target = box((3.0, 0.0, 0.0), (4.0, 1.0, 1.0))
 
-    # --- Case 1: unit cube vs a translated random point cloud -------------
-    cube = [(float(x), float(y), float(z))
-            for x in (-1.0, 1.0) for y in (-1.0, 1.0) for z in (-1.0, 1.0)]
-    cloud = [(rng.uniform(2.5, 4.0), rng.uniform(-1.0, 1.0),
-              rng.uniform(-1.0, 1.0)) for _ in range(16)]
+    print("=== 1. Head-on impact: unit cube moves +x at speed 1 ===")
+    # Face contact when A's max x reaches B's min x: 1 + t = 3 -> t=2;
+    # exit when A's min x passes B's max x: t = 4.
+    r = sweep_contact(cube, target, (1.0, 0.0, 0.0), 0.0, 6.0)
+    show("window [0, 6]", r, expected="intersecting [2.0, 4.0]")
 
-    res = distance(cube, cloud)
-    print("=== Case 1: unit cube vs translated 16-point cloud ===")
-    print(f"status          : {res.status}")
-    print(f"distance        : {res.distance:.12f}")
-    print(f"witness_a       : {fmt(res.witness_a)}")
-    print(f"witness_b       : {fmt(res.witness_b)}")
-    print(f"separating_axis : {fmt(res.separating_axis)}")
-    print(f"iterations      : {res.iterations}   residual: {res.residual:.3e}")
+    print("=== 2. Boundary cases ===")
+    # 2a. Grazing corner: path (t, .5, 3-.5t) touches corner (4,.5,1)
+    #     at exactly t=4.
+    r = sweep_contact([(0.0, 0.5, 3.0)],
+                      box((3.0, 0.0, 0.0), (4.0, 1.0, 1.0)),
+                      (1.0, 0.0, -0.5), 0.0, 8.0)
+    show("grazing corner (single instant, expected touching t=4)", r,
+         expected="touching (4.0, 4.0)")
 
-    n = res.separating_axis
-    wa_n = dot(res.witness_a, n)
-    wb_n = dot(res.witness_b, n)
-    min_a = min(dot(a, n) for a in cube)
-    max_b = max(dot(b, n) for b in cloud)
-    print("certificate check over all vertices:")
-    print(f"  min_A a.n = {min_a:.12f}  >=  wa.n = {wa_n:.12f}"
-          f"  -> {'OK' if min_a >= wa_n - 1e-9 else 'VIOLATED'}")
-    print(f"  max_B b.n = {max_b:.12f}  <=  wb.n = {wb_n:.12f}"
-          f"  -> {'OK' if max_b <= wb_n + 1e-9 else 'VIOLATED'}")
-    print(f"  separation gap min_A a.n - max_B b.n = {min_a - max_b:.12f} > 0")
-    print()
+    # 2b. Initial overlap of width 0.5, exit at t = 1.5.
+    overlapping = box((0.5, 0.0, 0.0), (1.5, 1.0, 1.0))
+    r = sweep_contact(cube, overlapping, (1.0, 0.0, 0.0), 0.0, 6.0)
+    show("initial overlap (expected intersecting [0, 1.5])", r,
+         expected="intersecting (0.0, 1.5)")
 
-    # --- Case 2: degenerate inputs (dimension reduction, no jitter) -------
-    segment = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0)]
-    triangle = [(3.0, -1.0, 0.0), (3.0, 1.0, -1.0), (3.0, 1.0, 1.0)]
-    res2 = distance(segment, triangle)
-    print("=== Case 2: segment vs triangle (degenerate, lower-dimensional) ===")
-    print(f"status          : {res2.status}")
-    print(f"distance        : {res2.distance:.12f}  (exact value: 1.0)")
-    print(f"witness_a       : {fmt(res2.witness_a)}")
-    print(f"witness_b       : {fmt(res2.witness_b)}")
-    print(f"iterations      : {res2.iterations}   residual: {res2.residual:.3e}")
-    print()
+    # 2c. Relative rest, separated: gap is a constant 2.
+    r = sweep_contact(cube, target, (0.0, 0.0, 0.0), 0.0, 6.0)
+    show("relative rest, separated (expected d=2)", r,
+         expected="separated")
 
-    # --- Case 3: contract violations are rejected, not silently fixed -----
-    print("=== Case 3: rejection of invalid input ===")
+    # 2d. Complete miss: transverse motion, gap only grows.
+    r = sweep_contact(cube, target, (0.0, 2.0, 0.0), 0.0, 6.0)
+    show("complete miss (expected min d=2 at t=0)", r,
+         expected="separated")
+
+    # 2e. Contact exactly at the window end.
+    r = sweep_contact(cube, target, (1.0, 0.0, 0.0), 0.0, 2.0)
+    show("contact exactly at t_end (expected touching t=2)", r,
+         expected="touching (2.0, 2.0)")
+
+    print("=== 3. Invalid inputs are rejected, no partial state ===")
     try:
-        distance([(0.0, 0.0, float("nan"))], cloud)
+        sweep_contact(cube, target, (1.0, 0.0), 0.0, 6.0)
     except InputError as exc:
-        print(f"NaN coordinate rejected  -> InputError: {exc}")
+        print(f"2-component velocity -> InputError: {exc}")
     try:
-        distance([(float(i), 0.0, 0.0) for i in range(65)], cloud)
+        sweep_contact(cube, target, (1.0, 0.0, 0.0), 6.0, 0.0)
     except InputError as exc:
-        print(f"65 points rejected       -> InputError: {exc}")
+        print(f"inverted window     -> InputError: {exc}")
     try:
-        distance(cube, cloud, max_iter=True)
+        sweep_contact(cube, target, (1.0, 0.0, float("nan")),
+                      0.0, 6.0)
     except InputError as exc:
-        print(f"bool max_iter rejected   -> InputError: {exc}")
+        print(f"NaN velocity        -> InputError: {exc}")
+
+    # The rejected calls leave no state: a valid call still works.
+    r = sweep_contact(cube, target, (1.0, 0.0, 0.0), 0.0, 6.0)
+    assert r.status == "intersecting" and abs(r.interval[0] - 2.0) < 1e-9
+    print("\nvalid call after rejections still reports interval "
+          f"[2, 4]: {r.status} {tuple(round(t, 9) for t in r.interval)}")
 
 
 if __name__ == "__main__":

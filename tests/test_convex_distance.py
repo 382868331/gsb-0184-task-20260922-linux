@@ -13,9 +13,11 @@ import unittest
 from convex_distance import (
     InputError,
     distance,
+    sweep_contact,
     STATUS_SEPARATED,
     STATUS_INTERSECTING,
     STATUS_NOT_CONVERGED,
+    STATUS_TOUCHING,
 )
 
 
@@ -381,6 +383,453 @@ class TestValidation(unittest.TestCase):
         res = distance([(F(0), F(0), F(0))], [(F(3), 4, 0)])
         self.assertEqual(res.status, STATUS_SEPARATED)
         self.assertAlmostEqual(res.distance, 5.0, delta=1e-12)
+
+
+# ===========================================================================
+# sweep_contact
+#
+# Independent references used below (none call sweep_contact to produce an
+# expected value):
+#   * ref_box_sweep_interval: closed-form overlap interval of two
+#     axis-aligned boxes under a constant translation (1D per axis);
+#   * point-vs-point / point-vs-box hand-computed examples;
+#   * a dense time grid of the *static* distance() as a supplementary
+#     cross-check (presence/absence of contact, minimum distance).
+# ===========================================================================
+
+def box_pts(lo, hi):
+    return [(x, y, z)
+            for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+            for z in (lo[2], hi[2])]
+
+
+def ref_box_sweep_interval(loA, hiA, vel, loB, hiB, t0, t1, eps=1e-9):
+    """Closed-form status/interval of A+vel*t overlapping box B.
+
+    Per axis the overlap is an interval of times; intersecting the three
+    intervals with the window gives the result.  Returns
+    "separated" / "touching" / "intersecting" and (lo, hi) or None.
+    """
+    enter, exit_ = t0, t1
+    for k in range(3):
+        vk = vel[k]
+        if abs(vk) < 1e-14:
+            if loA[k] > hiB[k] + eps or hiA[k] < loB[k] - eps:
+                return "separated", None
+            continue
+        ta = (hiB[k] - loA[k]) / vk
+        tb = (loB[k] - hiA[k]) / vk
+        a, b = min(ta, tb), max(ta, tb)
+        enter, exit_ = max(enter, a), min(exit_, b)
+        if exit_ < enter - eps:
+            return "separated", None
+    if exit_ - enter <= eps:
+        return "touching", (enter, enter)
+    return "intersecting", (enter, exit_)
+
+
+def grid_status(A, B, vel, t0, t1, n=160):
+    """Supplementary grid oracle built from the static distance only."""
+    ts = [t0 + (t1 - t0) * i / n for i in range(n + 1)]
+    ds = []
+    for t in ts:
+        At = [(p[0] + vel[0] * t, p[1] + vel[1] * t,
+               p[2] + vel[2] * t) for p in A]
+        r = distance(At, B)
+        ds.append(0.0 if r.status == STATUS_INTERSECTING else r.distance)
+    imin = min(range(n + 1), key=lambda i: ds[i])
+    return ts, ds, ts[imin], ds[imin]
+
+
+def point_in_box(p, lo, hi, eps=1e-7):
+    return all(lo[k] - eps <= p[k] <= hi[k] + eps for k in range(3))
+
+
+CUBE_A = box_pts((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+CUBE_B = box_pts((3.0, 0.0, 0.0), (4.0, 1.0, 1.0))
+OVERLAP_B = box_pts((0.5, 0.0, 0.0), (1.5, 1.0, 1.0))
+
+
+class TestSweepHandComputed(unittest.TestCase):
+    def test_head_on_interval_exact(self):
+        # A in [0,1]^3 moves +x at speed 1 into B in [3,4]x[0,1]x[0,1]:
+        # face contact at t=2, exit (A fully past B) at t=4.
+        res = sweep_contact(CUBE_A, CUBE_B, (1.0, 0.0, 0.0), 0.0, 6.0)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertEqual(res.initial_state, STATUS_SEPARATED)
+        self.assertFalse(res.relative_rest)
+        self.assertAlmostEqual(res.interval[0], 2.0, delta=1e-9)
+        self.assertAlmostEqual(res.interval[1], 4.0, delta=1e-9)
+        self.assertEqual(res.first_contact.kind, "impact")
+        self.assertEqual(res.last_contact.kind, "separation")
+        self.assertAlmostEqual(res.first_contact.time, 2.0, delta=1e-9)
+        self.assertAlmostEqual(res.last_contact.time, 4.0, delta=1e-9)
+        # impact witnesses coincide at the touching face point (3, y, z)
+        p = res.first_contact.point_a
+        self.assertAlmostEqual(p[0], 3.0, delta=1e-7)
+        self.assertTrue(0.0 - 1e-7 <= p[1] <= 1.0 + 1e-7)
+        self.assertTrue(0.0 - 1e-7 <= p[2] <= 1.0 + 1e-7)
+        self.assertAlmostEqual(
+            math.dist(res.first_contact.point_a,
+                      res.first_contact.point_b), 0.0, delta=1e-7)
+        # unit normal points from B toward A (the -x face)
+        n = res.first_contact.normal
+        self.assertAlmostEqual(math.sqrt(sum(c * c for c in n)), 1.0,
+                               delta=1e-9)
+        self.assertLess(n[0], -0.999)
+        self.assertEqual(res.closest_distance, 0.0)
+
+    def test_complete_miss_minimum_at_start(self):
+        # transverse +y motion: gap starts at 2 and only grows
+        res = sweep_contact(CUBE_A, CUBE_B, (0.0, 2.0, 0.0), 0.0, 6.0)
+        self.assertEqual(res.status, STATUS_SEPARATED)
+        self.assertIsNone(res.interval)
+        self.assertIsNone(res.first_contact)
+        self.assertIsNone(res.last_contact)
+        self.assertAlmostEqual(res.closest_distance, 2.0, delta=1e-9)
+        self.assertAlmostEqual(res.closest_time, 0.0, delta=1e-9)
+
+    def test_grazing_corner_single_instant(self):
+        # point p(t) = (t, 0.5, 3 - 0.5 t) meets the box corner
+        # (4, .5, 1) exactly at t=4 and nowhere else (hand-derived:
+        # d^2 = (t-4)^2 + (2-0.5t)^2 on t in [3,4], unique zero at 4).
+        B = box_pts((3.0, 0.0, 0.0), (4.0, 1.0, 1.0))
+        res = sweep_contact([(0.0, 0.5, 3.0)], B,
+                            (1.0, 0.0, -0.5), 0.0, 8.0)
+        self.assertEqual(res.status, STATUS_TOUCHING)
+        self.assertEqual(res.interval[0], res.interval[1])
+        self.assertAlmostEqual(res.first_contact.time, 4.0, delta=1e-8)
+        p = res.first_contact.point_a
+        self.assertAlmostEqual(p[0], 4.0, delta=1e-7)
+        self.assertAlmostEqual(p[1], 0.5, delta=1e-7)
+        self.assertAlmostEqual(p[2], 1.0, delta=1e-7)
+        # normal lies in the approach quadrant (-x, +z) of the corner
+        n = res.first_contact.normal
+        self.assertAlmostEqual(math.sqrt(sum(c * c for c in n)), 1.0,
+                               delta=1e-9)
+        self.assertLessEqual(n[0], 1e-6)
+        self.assertGreaterEqual(n[2], -1e-6)
+        self.assertEqual(res.first_contact.kind, "touch")
+
+    def test_point_through_point_is_touch(self):
+        res = sweep_contact([(-5.0, 0.0, 0.0)], [(0.0, 0.0, 0.0)],
+                            (1.0, 0.0, 0.0), 0.0, 10.0)
+        self.assertEqual(res.status, STATUS_TOUCHING)
+        self.assertAlmostEqual(res.interval[0], 5.0, delta=1e-9)
+        self.assertAlmostEqual(res.first_contact.point_a[0], 0.0,
+                               delta=1e-7)
+        n = res.first_contact.normal
+        self.assertAlmostEqual(n[0], -1.0, delta=1e-7)
+
+    def test_point_sweeping_across_box_face(self):
+        # point travels in the top face plane z=2 of B whose top is 2:
+        # it is on the surface for x in [3,4] -> interval [3,4].
+        B = box_pts((3.0, 0.0, 0.0), (4.0, 1.0, 2.0))
+        res = sweep_contact([(0.0, 0.5, 2.0)], B, (1.0, 0.0, 0.0),
+                            0.0, 6.0)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertAlmostEqual(res.interval[0], 3.0, delta=1e-8)
+        self.assertAlmostEqual(res.interval[1], 4.0, delta=1e-8)
+
+
+class TestSweepInitialOverlapAndRest(unittest.TestCase):
+    def test_initial_overlap_then_exit(self):
+        # overlap width in x is 0.5 initially; exit at t = 1.5
+        res = sweep_contact(CUBE_A, OVERLAP_B, (1.0, 0.0, 0.0),
+                            0.0, 6.0)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertEqual(res.initial_state, STATUS_INTERSECTING)
+        self.assertAlmostEqual(res.interval[0], 0.0, delta=1e-12)
+        self.assertAlmostEqual(res.interval[1], 1.5, delta=1e-8)
+        self.assertEqual(res.first_contact.kind, "initial_overlap")
+        self.assertEqual(res.first_contact.time, 0.0)
+        self.assertEqual(res.last_contact.kind, "separation")
+
+    def test_overlap_covers_whole_window(self):
+        res = sweep_contact(CUBE_A, OVERLAP_B, (1.0, 0.0, 0.0),
+                            0.0, 1.0)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertEqual(res.interval, (0.0, 1.0))
+        self.assertEqual(res.last_contact.kind, "window_end")
+
+    def test_relative_rest_separated(self):
+        res = sweep_contact(CUBE_A, CUBE_B, (0.0, 0.0, 0.0),
+                            0.0, 6.0)
+        self.assertEqual(res.status, STATUS_SEPARATED)
+        self.assertTrue(res.relative_rest)
+        self.assertAlmostEqual(res.closest_distance, 2.0, delta=1e-9)
+
+    def test_relative_rest_overlapping(self):
+        res = sweep_contact(CUBE_A, OVERLAP_B, (0.0, 0.0, 0.0),
+                            1.0, 7.0)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertTrue(res.relative_rest)
+        self.assertEqual(res.interval, (1.0, 7.0))
+        self.assertEqual(res.first_contact.kind, "initial_overlap")
+        self.assertEqual(res.last_contact.kind, "rest_overlap")
+
+    def test_contact_at_window_start(self):
+        res = sweep_contact(CUBE_A, CUBE_B, (1.0, 0.0, 0.0),
+                            2.0, 6.0)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertEqual(res.initial_state, STATUS_INTERSECTING)
+        self.assertAlmostEqual(res.interval[0], 2.0, delta=1e-10)
+        self.assertAlmostEqual(res.interval[1], 4.0, delta=1e-8)
+
+    def test_contact_at_window_end_is_touch(self):
+        res = sweep_contact(CUBE_A, CUBE_B, (1.0, 0.0, 0.0),
+                            0.0, 2.0)
+        self.assertEqual(res.status, STATUS_TOUCHING)
+        self.assertAlmostEqual(res.interval[0], 2.0, delta=1e-9)
+        self.assertAlmostEqual(res.interval[1], 2.0, delta=1e-9)
+
+    def test_still_overlapping_at_window_end(self):
+        res = sweep_contact(CUBE_A, CUBE_B, (1.0, 0.0, 0.0),
+                            0.0, 3.0)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertAlmostEqual(res.interval[0], 2.0, delta=1e-9)
+        self.assertAlmostEqual(res.interval[1], 3.0, delta=1e-12)
+        self.assertEqual(res.last_contact.kind, "window_end")
+
+    def test_touch_at_start_moving_apart(self):
+        # faces already coincide at t=0 (A max x = B min x = 1) and A
+        # moves away (-x): a single contact instant at the window start
+        B = box_pts((1.0, 0.0, 0.0), (2.0, 1.0, 1.0))
+        res = sweep_contact(CUBE_A, B, (-1.0, 0.0, 0.0), 0.0, 3.0)
+        self.assertEqual(res.status, STATUS_TOUCHING)
+        self.assertEqual(res.initial_state, STATUS_INTERSECTING)
+        self.assertAlmostEqual(res.first_contact.time, 0.0, delta=1e-10)
+
+
+class TestSweepRandomBoxes(unittest.TestCase):
+    def test_against_closed_form_box_reference(self):
+        rng = random.Random(707)
+        checked = 0
+        while checked < 60:
+            loA = tuple(rng.uniform(-3, 1) for _ in range(3))
+            hiA = tuple(loA[k] + rng.uniform(0.3, 2.0)
+                        for k in range(3))
+            loB = tuple(rng.uniform(-2, 4) for _ in range(3))
+            hiB = tuple(loB[k] + rng.uniform(0.3, 2.0)
+                        for k in range(3))
+            vel = tuple(rng.uniform(-3, 3) for _ in range(3))
+            t0 = rng.uniform(-1, 1)
+            t1 = t0 + rng.uniform(0.5, 5.0)
+            A, B = box_pts(loA, hiA), box_pts(loB, hiB)
+            want, wiv = ref_box_sweep_interval(
+                loA, hiA, vel, loB, hiB, t0, t1)
+            res = sweep_contact(A, B, vel, t0, t1)
+            self.assertNotEqual(res.status, STATUS_NOT_CONVERGED)
+            checked += 1
+            # status must agree (touching/intersecting may swap only at
+            # the reference's own epsilon boundary)
+            if res.status != want:
+                self.assertTrue(
+                    {res.status, want} <= {STATUS_TOUCHING,
+                                           STATUS_INTERSECTING})
+            if wiv is not None:
+                self.assertIsNotNone(res.interval)
+                self.assertAlmostEqual(res.interval[0], wiv[0],
+                                       delta=1e-6)
+                self.assertAlmostEqual(res.interval[1], wiv[1],
+                                       delta=1e-6)
+            else:
+                self.assertIsNone(res.interval)
+            # contact point lies in both bodies at the entry instant
+            if res.first_contact is not None and want != "separated":
+                tc = res.first_contact.time
+                loAt = tuple(loA[k] + vel[k] * tc for k in range(3))
+                hiAt = tuple(hiA[k] + vel[k] * tc for k in range(3))
+                p = res.first_contact.point_a
+                self.assertTrue(point_in_box(p, loAt, hiAt))
+                self.assertTrue(point_in_box(p, loB, hiB))
+            # a reported miss must show strictly positive grid distance
+            if res.status == STATUS_SEPARATED:
+                _, _, _, dg = grid_status(A, B, vel, t0, t1, 120)
+                self.assertGreater(dg, 1e-7)
+
+    def test_minimum_distance_matches_grid_on_misses(self):
+        rng = random.Random(808)
+        accepted = 0
+        while accepted < 20:
+            loA = tuple(rng.uniform(-2, 1) for _ in range(3))
+            hiA = tuple(loA[k] + rng.uniform(0.3, 1.5)
+                        for k in range(3))
+            loB = tuple(rng.uniform(4, 6) for _ in range(3))
+            hiB = tuple(loB[k] + rng.uniform(0.3, 1.5)
+                        for k in range(3))
+            vel = tuple(rng.uniform(-1.5, 1.5) for _ in range(3))
+            t0, t1 = 0.0, 3.0
+            A, B = box_pts(loA, hiA), box_pts(loB, hiB)
+            res = sweep_contact(A, B, vel, t0, t1)
+            if res.status != STATUS_SEPARATED:
+                continue
+            _, _, _, dg = grid_status(A, B, vel, t0, t1, 200)
+            # grid minimum overestimates; analytic value must not be
+            # above the grid by more than its discretisation
+            self.assertLessEqual(
+                res.closest_distance, dg + 5e-3 * max(1.0, dg))
+            accepted += 1
+
+
+class TestSweepRandomGeneric(unittest.TestCase):
+    def test_small_clouds_against_grid(self):
+        rng = random.Random(909)
+        checked = 0
+        while checked < 40:
+            na = rng.randint(1, 6)
+            nb = rng.randint(1, 6)
+            A = [tuple(rng.uniform(-3, 3) for _ in range(3))
+                 for _ in range(na)]
+            B = [tuple(rng.uniform(-3, 3) + 2.5 for _ in range(3))
+                 for _ in range(nb)]
+            vel = tuple(rng.uniform(-4, 4) for _ in range(3))
+            t0, t1 = 0.0, rng.uniform(0.5, 4.0)
+            res = sweep_contact(A, B, vel, t0, t1)
+            self.assertNotEqual(res.status, STATUS_NOT_CONVERGED)
+            ts, ds, tg, dg = grid_status(A, B, vel, t0, t1, 200)
+            checked += 1
+            if res.status == STATUS_SEPARATED:
+                self.assertGreater(dg, 1e-7)
+                self.assertLessEqual(
+                    res.closest_distance, dg + 5e-3 * max(1.0, dg))
+            else:
+                self.assertLessEqual(dg, 1e-7)
+                first_grid = next(t for t, d in zip(ts, ds)
+                                  if d <= 1e-7)
+                self.assertLess(
+                    abs(first_grid - res.interval[0]),
+                    (t1 - t0) / 100 + 1e-6)
+
+
+class TestSweepSymmetryAndDeterminism(unittest.TestCase):
+    def test_moving_B_with_opposite_velocity_matches(self):
+        # A(t) = A + v t against fixed B  <=>  fixed A against B - v t,
+        # i.e. sweep_contact(B, A, -v, ...) with bodies swapped.
+        rng = random.Random(111)
+        for _ in range(20):
+            A = [tuple(rng.uniform(-2, 2) for _ in range(3))
+                 for _ in range(rng.randint(2, 6))]
+            B = [tuple(rng.uniform(-2, 2) + 2.5 for _ in range(3))
+                 for _ in range(rng.randint(2, 6))]
+            vel = tuple(rng.uniform(-3, 3) for _ in range(3))
+            r1 = sweep_contact(A, B, vel, 0.0, 4.0)
+            r2 = sweep_contact(B, A, tuple(-c for c in vel), 0.0, 4.0)
+            self.assertEqual(r1.status, r2.status)
+            if r1.interval is not None:
+                self.assertAlmostEqual(r1.interval[0], r2.interval[0],
+                                       delta=1e-7)
+                self.assertAlmostEqual(r1.interval[1], r2.interval[1],
+                                       delta=1e-7)
+
+    def test_rotation_covariance(self):
+        # rotate both bodies and the velocity by 90 deg about z
+        rot = lambda p: (-p[1], p[0], p[2])
+        vel = (1.0, 0.0, 0.0)
+        r1 = sweep_contact(CUBE_A, CUBE_B, vel, 0.0, 6.0)
+        Ar = [rot(p) for p in CUBE_A]
+        Br = [rot(p) for p in CUBE_B]
+        vr = rot(vel)
+        r2 = sweep_contact(Ar, Br, vr, 0.0, 6.0)
+        self.assertEqual(r1.status, r2.status)
+        self.assertAlmostEqual(r1.interval[0], r2.interval[0],
+                               delta=1e-8)
+        self.assertAlmostEqual(r1.interval[1], r2.interval[1],
+                               delta=1e-8)
+        p1, p2 = r1.first_contact.point_a, r2.first_contact.point_a
+        for k in range(3):
+            self.assertAlmostEqual(rot(p1)[k], p2[k], delta=1e-7)
+
+    def test_deterministic(self):
+        args = (CUBE_A, CUBE_B, (1.3, -0.7, 0.4), -1.0, 4.0)
+        r1 = sweep_contact(*args)
+        r2 = sweep_contact(*args)
+        self.assertEqual(r1, r2)
+
+
+class TestSweepBudget(unittest.TestCase):
+    def test_budget_exhaustion_is_reported(self):
+        res = sweep_contact(CUBE_A, CUBE_B, (1.0, 0.0, 0.0),
+                            0.0, 6.0, max_iter=1)
+        self.assertEqual(res.status, STATUS_NOT_CONVERGED)
+        self.assertFalse(res.converged)
+        self.assertIsNone(res.interval)
+
+    def test_max_iter_out_of_range(self):
+        for bad in (0, 129, -1):
+            with self.assertRaises(InputError):
+                sweep_contact(CUBE_A, CUBE_B, (1, 0, 0), 0, 1,
+                              max_iter=bad)
+
+
+class TestSweepValidation(unittest.TestCase):
+    def _good(self):
+        return dict(A=[(0.0, 0.0, 0.0)], B=[(1.0, 0.0, 0.0)],
+                    velocity=(1.0, 0.0, 0.0), t_start=0.0, t_end=1.0)
+
+    def test_velocity_shape(self):
+        kw = self._good()
+        kw["velocity"] = (1.0, 0.0)
+        with self.assertRaisesRegex(InputError, "velocity: expected"):
+            sweep_contact(**kw)
+        kw = self._good()
+        kw["velocity"] = "nope"
+        with self.assertRaisesRegex(InputError, "velocity"):
+            sweep_contact(**kw)
+        kw = self._good()
+        kw["velocity"] = (True, 0.0, 0.0)
+        with self.assertRaisesRegex(InputError, r"velocity\[0\]"):
+            sweep_contact(**kw)
+
+    def test_velocity_nonfinite(self):
+        for j, bad in enumerate((float("nan"), float("inf"),
+                                 float("-inf"))):
+            kw = self._good()
+            kw["velocity"] = tuple(bad if k == j else 0.0
+                                   for k in range(3))
+            with self.assertRaisesRegex(InputError,
+                                        rf"velocity\[{j}\]"):
+                sweep_contact(**kw)
+
+    def test_time_validation(self):
+        kw = self._good()
+        kw["t_end"] = 0.0
+        with self.assertRaisesRegex(InputError, "t_start < t_end"):
+            sweep_contact(**kw)
+        kw = self._good()
+        kw["t_start"], kw["t_end"] = 2.0, 1.0
+        with self.assertRaisesRegex(InputError, "t_start < t_end"):
+            sweep_contact(**kw)
+        for name, bad in (("t_start", "x"), ("t_end", True),
+                          ("t_start", float("nan")),
+                          ("t_end", float("inf"))):
+            kw = self._good()
+            kw[name] = bad
+            with self.assertRaises(InputError):
+                sweep_contact(**kw)
+
+    def test_tol_validation(self):
+        for bad in (0.0, 1.0, -1e-9, float("nan")):
+            with self.assertRaises(InputError):
+                sweep_contact(CUBE_A, CUBE_B, (1, 0, 0), 0, 1, tol=bad)
+
+    def test_points_still_validated(self):
+        kw = self._good()
+        kw["A"] = []
+        with self.assertRaisesRegex(InputError, "A: expected 1..64"):
+            sweep_contact(**kw)
+        kw = self._good()
+        kw["B"] = [(0.0, float("inf"), 0.0)]
+        with self.assertRaisesRegex(InputError, r"B\[0\]\[1\]"):
+            sweep_contact(**kw)
+
+    def test_no_partial_state_on_bad_input(self):
+        # pure function: repeated valid call after a rejected one
+        with self.assertRaises(InputError):
+            sweep_contact(CUBE_A, CUBE_B, (1, 0), 0, 1)
+        res = sweep_contact(CUBE_A, CUBE_B, (1.0, 0.0, 0.0), 0, 6)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertAlmostEqual(res.interval[0], 2.0, delta=1e-9)
 
 
 if __name__ == "__main__":
