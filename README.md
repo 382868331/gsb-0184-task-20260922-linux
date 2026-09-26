@@ -1,12 +1,27 @@
-# convex_distance — 凸多面体最近点与分离证书
+# convex_distance — 凸多面体最近点、分离证书与穿透最小平移
 
 离线计算几何模块：给定两个凸包（各由 ≤ 64 个三维点表示），用 GJK 在
 Minkowski 差上迭代求原点最近点，输出距离、两物体上的重心组合见证点，
-以及可独立验证的分离方向证书。
+以及可独立验证的分离方向证书。确认相交后，EPA 在 Minkowski 差上扩展
+内接包围多面体，给出最小平移向量（穿透深度）的上下界、分离方向和
+两侧接触点。
 
-- **运行环境**：Python 3.14.7，Linux，仅标准库（`math` / `numbers` /
-  `dataclasses`），安装 Python 后无需任何额外依赖。
+- **版本**：1.1.0（新增 `penetration()`；`distance()` 接口与语义不变）。
+- **运行环境**：Python 3.14.7，Linux 原生，仅标准库（`math` /
+  `numbers` / `dataclasses`），无需任何第三方依赖、网络或 Docker。
 - **核心算法为从零实现**，未调用任何第三方计算几何库。
+
+## 环境准备与运行
+
+```bash
+python3 -m venv .venv          # 可选；模块零依赖，系统 Python 3.14 即可
+source .venv/bin/activate
+python -m unittest discover -s tests -v   # 测试入口（含独立对照实现）
+python demo.py                             # 距离/证书演示
+python demo_iteration.py                   # 穿透（EPA）演示，< 90 秒
+```
+
+所有入口均离线运行，不需要凭据或外部服务。
 
 ## 接口
 
@@ -34,6 +49,45 @@ res = distance(A, B, *, tol=1e-9, max_iter=128)
 | `residual` | 最终相对间隙 `(‖v‖² − w·v)/‖v‖²`；`separated` 时 ≤ `tol` |
 
 `n` 的方向约定为从 B 指向 A（`n = (wa − wb)/‖wa − wb‖`）。
+
+## 穿透查询接口
+
+```python
+from convex_distance import penetration, PenetrationResult
+
+res = penetration(A, B, *, tol=1e-9, max_iter=128)
+```
+
+输入契约与 `distance()` 完全相同（含全部 `InputError` 校验）；
+`max_iter` 为 GJK + EPA 共享的总迭代预算。`PenetrationResult`
+（frozen dataclass）字段：
+
+| 字段 | 含义 |
+|---|---|
+| `status` | `"penetrating"` / `"touching"` / `"separated"` / `"not_converged"` |
+| `depth_lower` | 穿透深度下界：最终内接多面体边界到原点的距离（可验证） |
+| `depth_upper` | 穿透深度上界：Minkowski 差沿最终方向的支撑值（可验证） |
+| `direction` | 单位向量 `n`：把 B 平移 `depth * n` 即可分离；`separated` 时为 `None` |
+| `contact_a` / `contact_b` | 两侧接触点（各自输入点的重心组合），满足 `contact_a − contact_b ≈ depth·n` |
+| `iterations` | 实际总迭代次数（GJK + EPA） |
+| `residual` | 界的相对间隙 `(upper − lower)/max(1, upper)`；`penetrating` 时 ≤ `tol` |
+
+状态语义：
+
+- `penetrating`：EPA 收敛，`depth_lower ≤ 真实深度 ≤ depth_upper`，
+  间隙 ≤ `tol`；`direction` 为验证过的最小平移方向。
+- `touching`：共面/接触但无正体积穿透（含 GJK 判定相交却无法构造
+  包含原点的正体积四面体、或深度上界 ≤ 零阈值的情形）。**明确的零深度
+  状态**，深度上下界均为 0.0，不冒充有方向。
+- `separated`：GJK 判定相离，深度为 0，无方向；`contact_a/b` 为
+  最近点对。
+- `not_converged`：迭代预算耗尽。**保留可验证的上下界**
+  （下界来自当前内接多面体，上界来自支撑函数），`direction` 是当前
+  最优方向而非验证过的唯一答案——退化面、重复支持点、预算耗尽都不会
+  用任意法向冒充唯一解。
+
+方向约定：`n` 从 A 指向 B，即把 **B** 平移 `+depth·n`（或把 A 平移
+`−depth·n`）可分离两物体。
 
 ## 错误语义
 
@@ -76,8 +130,13 @@ Minkowski 差内）严格区分，绝不互相冒充。
 
 ## 已知限制
 
-- 不提供穿透深度（EPA 超出本题范围）；相交/接触统一报 `intersecting`。
-- `not_converged` 时的 `separating_axis` 是未验证的最优方向，不能当证书用。
+- `distance()` 的 `not_converged` 状态下 `separating_axis` 是未验证的
+  最优方向，不能当证书用。
+- EPA 初始多面体由终止单纯形 + 26 个固定方向（坐标轴、面对角线、体
+  对角线）的支撑点枚举构造；对 ≤ 64 点的凸包足够稳健，但理论上存在
+  采样不足时退化为 `touching` 判定的可能。
+- `penetration()` 的 `not_converged` 状态下 `direction` 未经验证，
+  只有上下界是可验证的。
 - 只实现本题契约的数学子集（三维、凸包、距离与分离证书），不宣称兼容
   任何工业标准接口。
 - 坐标量级极端（≳ 1e150 或 ≲ 1e-150）时 float64 上溢/下溢不在保障范围内。
