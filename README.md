@@ -1,12 +1,24 @@
-# convex_distance — 凸多面体最近点与分离证书
+# convex_distance — 凸多面体最近点、分离证书与穿透深度
 
 离线计算几何模块：给定两个凸包（各由 ≤ 64 个三维点表示），用 GJK 在
 Minkowski 差上迭代求原点最近点，输出距离、两物体上的重心组合见证点，
-以及可独立验证的分离方向证书。
+以及可独立验证的分离方向证书；确认相交后用 EPA（扩展多面体）给出
+最小平移穿透深度的上下界、分离方向与两侧接触点。
 
 - **运行环境**：Python 3.14.7，Linux，仅标准库（`math` / `numbers` /
   `dataclasses`），安装 Python 后无需任何额外依赖。
 - **核心算法为从零实现**，未调用任何第三方计算几何库。
+- 当前版本：`1.1.0`（新增 `penetration()`；`distance()` 接口不变）。
+
+## 准备与运行
+
+```bash
+python3.14 -m venv .venv        # 可选；模块本身零依赖
+source .venv/bin/activate
+python -m unittest discover -s tests -v   # 全部测试（含独立对照）
+python demo.py                             # 距离/分离证书演示
+python demo_iteration.py                   # 穿透深度演示（正常+边界）
+```
 
 ## 接口
 
@@ -35,6 +47,33 @@ res = distance(A, B, *, tol=1e-9, max_iter=128)
 
 `n` 的方向约定为从 B 指向 A（`n = (wa − wb)/‖wa − wb‖`）。
 
+## 穿透查询（EPA）
+
+接口：`res = penetration(A, B, *, tol=1e-9, max_iter=128)`，返回
+`PenetrationResult`（frozen dataclass）。GJK 确认原点落入 Minkowski
+差 C = A − B 后，EPA 在 C 内部围绕原点扩展一个包围多面体，输出最
+小平移向量的可验证上下界：
+
+| 字段 | 含义 |
+|---|---|
+| `status` | penetrating / touching / separated / not_converged |
+| `depth` | 深度最优估计（上下界中点）；touching/separated 时为 0 |
+| `depth_lower` | 可验证下界：原点到内部多面体 P ⊆ C 最近三角面的距离，真实深度 ≥ 此值 |
+| `depth_upper` | 可验证上界：所有已查询单位法向 n 上 support_C(n)·n 的最小值，真实深度 ≤ 此值（初始四面体即提供 4 次查询，恒有限） |
+| `direction` | 单位向量 n（从 B 指向 A）：把 B 平移 t·n（任意 t > depth_upper）即可分离，depth·n 即（近似）最小平移向量；touching/separated 时为 None |
+| `witness_a` / `witness_b` | 接触点，分别为 A、B 输入点的重心组合；witness_a − witness_b = depth_lower · direction |
+| `iterations` | GJK 播种 + EPA 扩展的实际迭代数（两阶段预算各为 max_iter） |
+| `residual` | (depth_upper − depth_lower) / depth_upper；收敛时 ≈ ≤ tol |
+
+**零深度明确状态**：共面贴合、共享棱/顶点等“相交但无正体积穿透”
+的情形返回 status=touching、depth=0、direction=None —— 不虚构任
+何法向。判定依据是 EPA 下界收敛到零阈值以下，而非 GJK 单纯形的偶
+然形状。
+
+**退化与预算**：退化面（零面积）在构面时直接跳过；重复支持点或迭
+代预算耗尽时返回 not_converged，但 depth_lower/depth_upper 仍是可
+独立验证的界，direction 标注为当前最优而非已认证的唯一答案。
+
 ## 错误语义
 
 所有非法输入抛出 `InputError`（`ValueError` 子类），消息可定位到具体元素：
@@ -48,7 +87,8 @@ res = distance(A, B, *, tol=1e-9, max_iter=128)
 失败不会留下部分变更的状态。
 
 `"not_converged"`（搜索预算耗尽）与 `"intersecting"`（已证明原点落在
-Minkowski 差内）严格区分，绝不互相冒充。
+Minkowski 差内）严格区分，绝不互相冒充。`penetration()` 的输入校验与
+`distance()` 完全一致。
 
 ## 误差口径（浮点）
 
@@ -73,10 +113,15 @@ Minkowski 差内）严格区分，绝不互相冒充。
 - **见证点**：每个单纯形点同时记录 A、B 两侧的支撑点，最终用重心权重
   组合出 `witness_a` / `witness_b`。
 - **确定性**：支撑函数平局取最小下标，初始方向取质心差，结果可复现。
+- **EPA 穿透**：GJK 单纯形播种四面体（退化时沿正交方向补支持点），
+  逐次取离原点最近面、沿其法向取支持点扩展；下界=原点到内部多面体最近
+  三角面距离，上界=已查法向的最小支持值，两者都可独立验证。
 
 ## 已知限制
 
-- 不提供穿透深度（EPA 超出本题范围）；相交/接触统一报 `intersecting`。
+- `distance()` 不提供穿透深度（用 `penetration()`）；相交/接触统一报 `intersecting`。
+- `penetration()` 的 `not_converged` 只保证上下界有效，`direction` 是当前最优
+  而非已认证的唯一方向；`touching` 时不给方向。
 - `not_converged` 时的 `separating_axis` 是未验证的最优方向，不能当证书用。
 - 只实现本题契约的数学子集（三维、凸包、距离与分离证书），不宣称兼容
   任何工业标准接口。
@@ -90,4 +135,5 @@ python demo.py                            # < 1 秒，打印分离证书与拒�
 ```
 
 测试中的参考实现（点-线段解析式、轴对齐盒解析式、小凸组合穷举的
-active-set 枚举）全部独立写在 `tests/` 内，不调用被测核心。
+active-set 枚举，以及穿透测试里的 SAT 候选轴枚举与 Carathéodory 凸
+组合判定）全部独立写在 `tests/` 内，不调用被测核心。
