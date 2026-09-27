@@ -13,7 +13,7 @@ Minkowski 差上迭代求原点最近点，输出距离、两物体上的重心�
 ```python
 from convex_distance import distance, DistanceResult, InputError
 
-res = distance(A, B, *, tol=1e-9, max_iter=128)
+res = distance(A, B, *, tol=1e-9, max_iter=128, warm_start=None)
 ```
 
 - `A`, `B`：各 1..64 个点的序列；每个点是恰好 3 个有限实数
@@ -21,6 +21,13 @@ res = distance(A, B, *, tol=1e-9, max_iter=128)
   只通过 support 函数访问。
 - `tol`：相对收敛容差，有限实数，`0 < tol < 1`。
 - `max_iter`：GJK 迭代预算，整数，`1..128`（题面契约上限即 128）。
+- `warm_start`：可选，上一次 `distance()` 返回的 `DistanceResult`
+  （例如上一帧的结果）。只复用其中最终单纯形的**支撑点索引**：
+  用当前输入重新求值这些候选点作为搜索起点，加速接近状态下的连续
+  查询。复用只影响搜索路径（体现在 `iterations` 上），旧的距离、
+  见证点、分离结论一律不被信任，全部按本轮输入重新计算并通过相同
+  的收敛/包含检查。索引与当前输入规模不匹配（形状改变）时丢弃对应
+  候选，完全不可用时退回正常的冷启动初始化；其他类型报 `InputError`。
 
 `DistanceResult`（frozen dataclass）字段：
 
@@ -85,7 +92,7 @@ Minkowski 差内）严格区分，绝不互相冒充。
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 23 个测试
+python -m unittest discover -s tests -v   # 29 个测试
 python demo.py                            # < 1 秒，打印分离证书与拒绝示例
 ```
 

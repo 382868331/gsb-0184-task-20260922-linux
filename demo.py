@@ -53,6 +53,32 @@ def main():
     print(f"  separation gap min_A a.n - max_B b.n = {min_a - max_b:.12f} > 0")
     print()
 
+    # --- Case 1b: warm-started continuous frames --------------------------
+    print("=== Case 1b: 4 consecutive frames, cold vs warm-started ===")
+    prev = None
+    for t in range(4):
+        off = 2.5 + 0.05 * t
+        frame = [(rng.uniform(off, off + 1.5), rng.uniform(-1.0, 1.0),
+                  rng.uniform(-1.0, 1.0)) for _ in range(16)]
+        cold = distance(cube, frame)
+        warm = distance(cube, frame, warm_start=prev) if prev else None
+        if warm is None:
+            print(f"frame {t}: cold iterations = {cold.iterations}")
+        else:
+            assert warm.status == cold.status
+            assert abs(warm.distance - cold.distance) < 1e-12
+            print(f"frame {t}: cold iterations = {cold.iterations}, "
+                  f"warm-started iterations = {warm.iterations} "
+                  f"(same distance {warm.distance:.12f})")
+        prev = cold
+        last = warm if warm is not None else cold
+    # the last warm-started result still carries a valid certificate
+    n = last.separating_axis
+    print(f"last frame certificate: min_A a.n - max_B b.n = "
+          f"{min(dot(a, n) for a in cube) - max(dot(b, n) for b in frame):.12f}"
+          f" > 0 (recomputed, not cached)")
+    print()
+
     # --- Case 2: degenerate inputs (dimension reduction, no jitter) -------
     segment = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0)]
     triangle = [(3.0, -1.0, 0.0), (3.0, 1.0, -1.0), (3.0, 1.0, 1.0)]

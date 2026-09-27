@@ -2,7 +2,7 @@
 
 Public contract
 ---------------
-distance(A, B, *, tol=1e-9, max_iter=128) -> DistanceResult
+distance(A, B, *, tol=1e-9, max_iter=128, warm_start=None) -> DistanceResult
 
 * ``A`` / ``B``: sequences of 1..64 points; each point is a sequence of
   exactly 3 finite real numbers (``int`` / ``float`` / ``Fraction``;
@@ -12,6 +12,17 @@ distance(A, B, *, tol=1e-9, max_iter=128) -> DistanceResult
   ``0 < tol < 1``.  ``bool`` is rejected.
 * ``max_iter``: GJK iteration budget, an ``int`` with
   ``1 <= max_iter <= 128``.  ``bool`` is rejected.
+* ``warm_start``: optional previous :class:`DistanceResult` from an
+  earlier query (e.g. the previous animation frame).  Only the final
+  simplex's support *indices* are reused: they are re-evaluated against
+  the *new* inputs to seed the search with candidate points of the
+  current Minkowski difference.  No cached distance, witness, or
+  separation conclusion is ever trusted -- every reported result is
+  recomputed and re-verified by the same convergence and containment
+  checks as a cold run.  Indices that do not match the current input
+  sizes (shape changed) are discarded; if nothing usable remains, the
+  solver falls back to the normal cold initialisation.  Any other type
+  is rejected with :class:`InputError`.
 
 Invalid input raises :class:`InputError` (a ``ValueError``) with a message
 that locates the offending element, e.g. ``"A[3][1]: ..."``.  Nothing is
@@ -40,6 +51,10 @@ residual         final relative gap (||v||^2 - w.v) / ||v||^2; 0.0 for
 "intersecting" (origin proven inside the Minkowski difference); the two
 are never conflated.  Touching hulls (distance exactly zero) are reported
 as "intersecting" with distance <= the zero threshold.
+
+Warm-start reuse only affects the *search path* (and hence the reported
+iteration count), never the acceptance criteria: a warm-started result
+satisfies exactly the same certificate guarantees as a cold one.
 """
 
 from __future__ import annotations
@@ -92,6 +107,10 @@ class DistanceResult:
     separating_axis: tuple | None
     iterations: int
     residual: float
+    # Internal warm-start token: support-index pairs of the final
+    # simplex.  Not part of the mathematical result; only reused as
+    # candidate starting points by a subsequent distance() call.
+    _cache: tuple | None = None
 
     @property
     def converged(self) -> bool:
@@ -180,8 +199,9 @@ def _validate_max_iter(max_iter):
 # ---------------------------------------------------------------------------
 
 def _support(A, B, d):
-    """Return (w, a, b) with a = argmax_A a.d, b = argmin_B b.d, w = a - b.
+    """Return (w, a, b, ai, bi): support of the Minkowski difference.
 
+    a = A[ai] = argmax_A a.d, b = B[bi] = argmin_B b.d, w = a - b.
     Ties are broken deterministically by lowest index.
     """
     ai = 0
@@ -200,7 +220,7 @@ def _support(A, B, d):
             bi = i
     a = A[ai]
     b = B[bi]
-    return (_sub(a, b), a, b)
+    return (_sub(a, b), a, b, ai, bi)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +322,18 @@ def _closest_on_simplex(simplex):
 # main entry point
 # ---------------------------------------------------------------------------
 
-def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
+def _validate_warm_start(warm_start):
+    if warm_start is None:
+        return None
+    if not isinstance(warm_start, DistanceResult):
+        raise InputError(
+            f"warm_start: expected a DistanceResult returned by an "
+            f"earlier distance() call, got "
+            f"{type(warm_start).__name__} ({warm_start!r})")
+    return warm_start._cache
+
+
+def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER, warm_start=None):
     """Closest distance between conv(A) and conv(B) with witnesses.
 
     See the module docstring for the full contract.
@@ -311,6 +342,7 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
     pts_b = _validate_points(B, "B")
     tol = _validate_tol(tol)
     max_iter = _validate_max_iter(max_iter)
+    cache = _validate_warm_start(warm_start)
 
     scale = 1.0
     for p in pts_a:
@@ -333,11 +365,7 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
     cb = (sum(p[0] for p in pts_b) / nb,
           sum(p[1] for p in pts_b) / nb,
           sum(p[2] for p in pts_b) / nb)
-    d = _sub(ca, cb)
-    if _norm2(d) == 0.0:
-        d = (1.0, 0.0, 0.0)
-
-    simplex = []          # list of (w, a, b)
+    simplex = []          # list of (w, a, b, ai, bi)
     v = None              # current closest point of conv(simplex)
     v2 = 0.0
     lam = ()
@@ -345,9 +373,52 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
     status = STATUS_NOT_CONVERGED
     iterations = 0
 
+    # Warm start: re-evaluate the cached support indices against the
+    # *current* points.  Each seeded w = A[ai] - B[bi] is a genuine
+    # point of the current Minkowski difference, so the seed only
+    # influences the search path; every conclusion below is still
+    # established by the usual fresh convergence/containment checks.
+    # Stale indices (shape changed) are dropped; if nothing usable
+    # remains we fall through to the cold initialisation.
+    seeded = False
+    if cache:
+        seen = set()
+        for ai, bi in cache:
+            if not (0 <= ai < na and 0 <= bi < nb):
+                continue
+            key = (ai, bi)
+            if key in seen:
+                continue
+            seen.add(key)
+            a = pts_a[ai]
+            b = pts_b[bi]
+            w = _sub(a, b)
+            if any(w == s[0] for s in simplex):
+                continue
+            simplex.append((w, a, b, ai, bi))
+        if simplex:
+            v, lam, keep = _closest_on_simplex(simplex)
+            simplex = [simplex[i] for i in keep]
+            v2 = _norm2(v)
+            seeded = True
+            if v2 <= zero_tol2:
+                # Seeded candidates already contain the origin: the
+                # hulls intersect (proven on current inputs).
+                residual = 0.0
+                status = STATUS_INTERSECTING
+    if not seeded:
+        # Initial search direction: centroid difference (deterministic).
+        d = _sub(ca, cb)
+        if _norm2(d) == 0.0:
+            d = (1.0, 0.0, 0.0)
+    else:
+        d = (-v[0], -v[1], -v[2])
+
     for it in range(1, max_iter + 1):
+        if status == STATUS_INTERSECTING:
+            break  # already proven by the warm-started seed simplex
         iterations = it
-        w, sa, sb = _support(pts_a, pts_b, d)
+        w, sa, sb, ai, bi = _support(pts_a, pts_b, d)
         if v is not None:
             # w = argmin_{c in C} c.v, so ||c*|| >= w.v / ||v|| and the
             # relative gap (v2 - w.v)/v2 bounds the remaining error.
@@ -362,7 +433,7 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
             residual = 0.0
             status = STATUS_SEPARATED
             break
-        simplex.append((w, sa, sb))
+        simplex.append((w, sa, sb, ai, bi))
         v, lam, keep = _closest_on_simplex(simplex)
         simplex = [simplex[i] for i in keep]
         v2 = _norm2(v)
@@ -375,7 +446,7 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
 
     # Barycentric witnesses on both bodies.
     wax = way = waz = wbx = wby = wbz = 0.0
-    for (w, sa, sb), l in zip(simplex, lam):
+    for (w, sa, sb, ai, bi), l in zip(simplex, lam):
         wax += l * sa[0]
         way += l * sa[1]
         waz += l * sa[2]
@@ -402,4 +473,5 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
         separating_axis=axis,
         iterations=iterations,
         residual=residual,
+        _cache=tuple((s[3], s[4]) for s in simplex),
     )

@@ -333,6 +333,91 @@ class TestBudgetAndStatus(unittest.TestCase):
             distance([(0, 0, 0)], [(1, 0, 0)], max_iter=129)
 
 
+class TestWarmStart(unittest.TestCase):
+    def _frames(self):
+        rng = random.Random(7)
+        base = [(float(x), float(y), float(z))
+                for x in (-1.0, 1.0) for y in (-1.0, 1.0)
+                for z in (-1.0, 1.0)]
+        frames = []
+        for t in range(4):
+            off = 2.5 + 0.05 * t
+            cloud = [(rng.uniform(off, off + 1.5), rng.uniform(-1.0, 1.0),
+                      rng.uniform(-1.0, 1.0)) for _ in range(16)]
+            frames.append((base, cloud))
+        return frames
+
+    def test_warm_result_matches_cold(self):
+        prev = None
+        for A, B in self._frames():
+            cold = distance(A, B)
+            warm = distance(A, B, warm_start=prev) if prev else None
+            if warm is not None:
+                self.assertEqual(warm.status, cold.status)
+                self.assertAlmostEqual(warm.distance, cold.distance,
+                                       delta=1e-12)
+                for wa, wc in zip(warm.witness_a, cold.witness_a):
+                    self.assertAlmostEqual(wa, wc, delta=1e-9)
+                # reuse must not increase the iteration count
+                self.assertLessEqual(warm.iterations, cold.iterations)
+            prev = cold
+
+    def test_warm_result_still_certified(self):
+        frames = self._frames()
+        prev = distance(*frames[0])
+        A, B = frames[1]
+        res = distance(A, B, warm_start=prev)
+        self.assertEqual(res.status, STATUS_SEPARATED)
+        n = res.separating_axis
+        self.assertAlmostEqual(_dot(n, n), 1.0, delta=1e-9)
+        wa_n = _dot(res.witness_a, n)
+        wb_n = _dot(res.witness_b, n)
+        for a in A:
+            self.assertGreaterEqual(_dot(a, n), wa_n - 1e-7)
+        for b in B:
+            self.assertLessEqual(_dot(b, n), wb_n + 1e-7)
+        self.assertLessEqual(res.residual, 1e-9)
+
+    def test_shape_change_falls_back(self):
+        A, B = self._frames()[0]
+        prev = distance(A, B)
+        # different point counts: cached indices no longer match
+        B2 = B[:9]
+        res = distance(A, B2, warm_start=prev)
+        cold = distance(A, B2)
+        self.assertEqual(res.status, cold.status)
+        self.assertAlmostEqual(res.distance, cold.distance, delta=1e-12)
+
+    def test_unrelated_cache_still_correct(self):
+        frames = self._frames()
+        prev = distance(*frames[0])
+        # a completely different pair queried with a stale cache
+        A = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]
+        B = [(0.0, 5.0, 0.0)]
+        res = distance(A, B, warm_start=prev)
+        self.assertEqual(res.status, STATUS_SEPARATED)
+        self.assertAlmostEqual(res.distance, 5.0, delta=1e-9)
+
+    def test_warm_start_type_rejected(self):
+        with self.assertRaisesRegex(InputError, "warm_start"):
+            distance([(0, 0, 0)], [(1, 0, 0)], warm_start="cache")
+        with self.assertRaisesRegex(InputError, "warm_start"):
+            distance([(0, 0, 0)], [(1, 0, 0)], warm_start=42)
+
+    def test_warm_intersecting_frame(self):
+        A = [(float(x), float(y), float(z))
+             for x in (-1.0, 1.0) for y in (-1.0, 1.0)
+             for z in (-1.0, 1.0)]
+        B = [(x + 3.0, y, z) for x, y, z in A]
+        prev = distance(A, B)
+        self.assertEqual(prev.status, STATUS_SEPARATED)
+        # next frame: B moved so the hulls overlap
+        B2 = [(x + 1.5, y, z) for x, y, z in A]
+        res = distance(A, B2, warm_start=prev)
+        self.assertEqual(res.status, STATUS_INTERSECTING)
+        self.assertIsNone(res.separating_axis)
+
+
 class TestValidation(unittest.TestCase):
     def test_nan_and_inf_rejected(self):
         with self.assertRaisesRegex(InputError, r"A\[0\]\[2\]"):
