@@ -12,6 +12,9 @@ distance(A, B, *, tol=1e-9, max_iter=128) -> DistanceResult
   ``0 < tol < 1``.  ``bool`` is rejected.
 * ``max_iter``: GJK iteration budget, an ``int`` with
   ``1 <= max_iter <= 128``.  ``bool`` is rejected.
+* ``warm_start``: optional :class:`WarmStart` from an earlier query.  It is
+  only an initial simplex; every returned distance/status is recomputed and
+  certified in the current call.
 
 Invalid input raises :class:`InputError` (a ``ValueError``) with a message
 that locates the offending element, e.g. ``"A[3][1]: ..."``.  Nothing is
@@ -30,11 +33,12 @@ separating_axis  unit vector n with min_A a.n >= wa.n and
                  max_B b.n <= wb.n (a verified certificate when
                  status == "separated"); None when "intersecting"; for
                  "not_converged" the best known direction, NOT verified.
-iterations       GJK iterations actually used.
+iterations       GJK support iterations actually used.
 residual         final relative gap (||v||^2 - w.v) / ||v||^2; 0.0 for
                  "intersecting".  For "separated" it is <= tol; for
                  "not_converged" it is > tol and bounds the remaining
                  relative uncertainty of ``distance``.
+warm_start       reusable candidate simplex for a nearby following frame.
 
 "not_converged" (search budget exhausted) is reported distinctly from
 "intersecting" (origin proven inside the Minkowski difference); the two
@@ -51,6 +55,7 @@ from dataclasses import dataclass
 __all__ = [
     "distance",
     "DistanceResult",
+    "WarmStart",
     "InputError",
     "MAX_POINTS",
     "MAX_ITER",
@@ -84,6 +89,15 @@ class InputError(ValueError):
 
 
 @dataclass(frozen=True)
+class WarmStart:
+    """Indexed GJK simplex that can seed a nearby following frame."""
+
+    pairs: tuple[tuple[int, int], ...]
+    point_count_a: int
+    point_count_b: int
+
+
+@dataclass(frozen=True)
 class DistanceResult:
     status: str
     distance: float
@@ -92,6 +106,7 @@ class DistanceResult:
     separating_axis: tuple | None
     iterations: int
     residual: float
+    warm_start: WarmStart | None = None
 
     @property
     def converged(self) -> bool:
@@ -184,6 +199,11 @@ def _support(A, B, d):
 
     Ties are broken deterministically by lowest index.
     """
+    w, a, b, _, _ = _support_indexed(A, B, d)
+    return (w, a, b)
+
+
+def _support_indexed(A, B, d):
     ai = 0
     best = _dot(A[0], d)
     for i in range(1, len(A)):
@@ -200,7 +220,53 @@ def _support(A, B, d):
             bi = i
     a = A[ai]
     b = B[bi]
-    return (_sub(a, b), a, b)
+    return (_sub(a, b), a, b, ai, bi)
+
+
+def _load_warm_start(warm_start, pts_a, pts_b):
+    """Return indexed support records, or None when the cache is unusable."""
+    if not isinstance(warm_start, WarmStart):
+        return None
+    try:
+        pairs = list(warm_start.pairs)
+    except TypeError:
+        return None
+    count_a = warm_start.point_count_a
+    count_b = warm_start.point_count_b
+    if isinstance(count_a, bool) or isinstance(count_b, bool):
+        return None
+    if not isinstance(count_a, int) or not isinstance(count_b, int):
+        return None
+    if count_a != len(pts_a):
+        return None
+    if count_b != len(pts_b):
+        return None
+    if not 1 <= len(pairs) <= 4:
+        return None
+
+    records = []
+    seen = set()
+    for pair in pairs:
+        try:
+            if len(pair) != 2:
+                return None
+            ai, bi = pair
+        except (TypeError, KeyError):
+            return None
+        if isinstance(ai, bool) or isinstance(bi, bool):
+            return None
+        if not isinstance(ai, int) or not isinstance(bi, int):
+            return None
+        if not 0 <= ai < len(pts_a) or not 0 <= bi < len(pts_b):
+            return None
+        key = (ai, bi)
+        if key in seen:
+            continue
+        seen.add(key)
+        a = pts_a[ai]
+        b = pts_b[bi]
+        records.append((_sub(a, b), a, b, ai, bi))
+    return records or None
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +368,7 @@ def _closest_on_simplex(simplex):
 # main entry point
 # ---------------------------------------------------------------------------
 
-def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
+def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER, warm_start=None):
     """Closest distance between conv(A) and conv(B) with witnesses.
 
     See the module docstring for the full contract.
@@ -337,7 +403,7 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
     if _norm2(d) == 0.0:
         d = (1.0, 0.0, 0.0)
 
-    simplex = []          # list of (w, a, b)
+    simplex = []          # list of (w, a, b, index_a, index_b)
     v = None              # current closest point of conv(simplex)
     v2 = 0.0
     lam = ()
@@ -345,37 +411,45 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
     status = STATUS_NOT_CONVERGED
     iterations = 0
 
-    for it in range(1, max_iter + 1):
-        iterations = it
-        w, sa, sb = _support(pts_a, pts_b, d)
-        if v is not None:
-            # w = argmin_{c in C} c.v, so ||c*|| >= w.v / ||v|| and the
-            # relative gap (v2 - w.v)/v2 bounds the remaining error.
-            gap = v2 - _dot(w, v)
-            residual = gap / v2 if v2 > 0.0 else 0.0
-            if gap <= tol * v2:
+    if warm_start is not None:
+        simplex = _load_warm_start(warm_start, pts_a, pts_b) or []
+        if simplex:
+            v, lam, keep = _closest_on_simplex(simplex)
+            simplex = [simplex[i] for i in keep]
+            v2 = _norm2(v)
+            if v2 <= zero_tol2:
+                residual = 0.0
+                status = STATUS_INTERSECTING
+            if v2 > 0.0:
+                d = (-v[0], -v[1], -v[2])
+
+    if status != STATUS_INTERSECTING:
+        for it in range(1, max_iter + 1):
+            iterations = it
+            w, sa, sb, sai, sbi = _support_indexed(pts_a, pts_b, d)
+            if v is not None:
+                gap = v2 - _dot(w, v)
+                residual = gap / v2 if v2 > 0.0 else 0.0
+                if gap <= tol * v2:
+                    status = STATUS_SEPARATED
+                    break
+            if any((sai, sbi) == (s[3], s[4]) for s in simplex):
+                residual = 0.0
                 status = STATUS_SEPARATED
                 break
-        if any(w == s[0] for s in simplex):
-            # Support point already in the simplex: w.v == v2, the gap is
-            # exactly zero and no further progress is possible.
-            residual = 0.0
-            status = STATUS_SEPARATED
-            break
-        simplex.append((w, sa, sb))
-        v, lam, keep = _closest_on_simplex(simplex)
-        simplex = [simplex[i] for i in keep]
-        v2 = _norm2(v)
-        if v2 <= zero_tol2:
-            # Origin lies in conv(simplex) subset C: hulls intersect.
-            residual = 0.0
-            status = STATUS_INTERSECTING
-            break
-        d = (-v[0], -v[1], -v[2])
+            simplex.append((w, sa, sb, sai, sbi))
+            v, lam, keep = _closest_on_simplex(simplex)
+            simplex = [simplex[i] for i in keep]
+            v2 = _norm2(v)
+            if v2 <= zero_tol2:
+                residual = 0.0
+                status = STATUS_INTERSECTING
+                break
+            d = (-v[0], -v[1], -v[2])
 
     # Barycentric witnesses on both bodies.
     wax = way = waz = wbx = wby = wbz = 0.0
-    for (w, sa, sb), l in zip(simplex, lam):
+    for (w, sa, sb, sai, sbi), l in zip(simplex, lam):
         wax += l * sa[0]
         way += l * sa[1]
         waz += l * sa[2]
@@ -394,6 +468,12 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
     else:
         axis = None
 
+    next_warm_start = WarmStart(
+        tuple((s[3], s[4]) for s in simplex),
+        len(pts_a),
+        len(pts_b),
+    )
+
     return DistanceResult(
         status=status,
         distance=dist,
@@ -402,4 +482,5 @@ def distance(A, B, *, tol=DEFAULT_TOL, max_iter=MAX_ITER):
         separating_axis=axis,
         iterations=iterations,
         residual=residual,
+        warm_start=next_warm_start,
     )

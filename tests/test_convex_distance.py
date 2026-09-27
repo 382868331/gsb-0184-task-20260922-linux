@@ -12,11 +12,106 @@ import unittest
 
 from convex_distance import (
     InputError,
+    WarmStart,
     distance,
     STATUS_SEPARATED,
     STATUS_INTERSECTING,
     STATUS_NOT_CONVERGED,
 )
+
+
+def tetra_fixture(offset=3.0):
+    A = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+         (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    B = [(offset, 0.0, 0.0), (offset + 1.0, 0.0, 0.0),
+         (offset, 1.0, 0.0), (offset, 0.0, 1.0)]
+    return A, B
+
+
+class TestWarmStart(unittest.TestCase):
+    def test_nearby_frame_reuses_candidate_and_recertifies(self):
+        A, B = tetra_fixture()
+        first = distance(A, B)
+        B_next = [(x + 0.01, y, z) for x, y, z in B]
+
+        cold = distance(A, B_next)
+        warm = distance(A, B_next, warm_start=first.warm_start)
+
+        self.assertEqual(warm.status, STATUS_SEPARATED)
+        self.assertAlmostEqual(warm.distance, 2.01, delta=1e-10)
+        self.assertLess(warm.iterations, cold.iterations)
+        self.assertEqual(warm.iterations, 1)
+        n = warm.separating_axis
+        self.assertAlmostEqual(_dot(n, n), 1.0, delta=1e-12)
+        wa_n = _dot(warm.witness_a, n)
+        wb_n = _dot(warm.witness_b, n)
+        self.assertGreaterEqual(min(_dot(a, n) for a in A), wa_n - 1e-10)
+        self.assertLessEqual(max(_dot(b, n) for b in B_next), wb_n + 1e-10)
+        self.assertAlmostEqual(wa_n - wb_n, warm.distance, delta=1e-10)
+
+    def test_separated_cache_does_not_trust_old_status_after_intersection(self):
+        A, B = tetra_fixture()
+        first = distance(A, B)
+        B_intersecting = [(x - 3.5, y, z) for x, y, z in B]
+
+        result = distance(A, B_intersecting, warm_start=first.warm_start)
+
+        self.assertEqual(result.status, STATUS_INTERSECTING)
+        self.assertIsNone(result.separating_axis)
+        self.assertEqual(result.distance, 0.0)
+
+    def test_intersecting_cache_does_not_trust_old_status_after_separation(self):
+        A, B = tetra_fixture()
+        B_intersecting = [(x - 3.5, y, z) for x, y, z in B]
+        intersecting = distance(A, B_intersecting)
+        self.assertEqual(intersecting.status, STATUS_INTERSECTING)
+
+        result = distance(A, B, warm_start=intersecting.warm_start)
+
+        self.assertEqual(result.status, STATUS_SEPARATED)
+        self.assertAlmostEqual(result.distance, 2.0, delta=1e-10)
+        self.assertLessEqual(result.residual, 1e-9)
+
+    def test_out_of_range_cache_falls_back_to_cold_start(self):
+        A, B = tetra_fixture()
+        stale = WarmStart(pairs=((0, 99),), point_count_a=len(A),
+                          point_count_b=len(B))
+
+        cold = distance(A, B)
+        warm = distance(A, B, warm_start=stale)
+
+        self.assertEqual(warm.status, cold.status)
+        self.assertEqual(warm.iterations, cold.iterations)
+        self.assertEqual(warm.distance, cold.distance)
+        self.assertIsInstance(warm.warm_start, WarmStart)
+
+    def test_changed_point_count_falls_back_to_cold_start(self):
+        A, B = tetra_fixture()
+        first = distance(A, B)
+        B_next = [(2.0, 0.0, 0.0), (2.0, 1.0, 0.0), (2.0, 0.0, 1.0)]
+
+        cold = distance(A, B_next)
+        warm = distance(A, B_next, warm_start=first.warm_start)
+
+        self.assertEqual(warm.status, cold.status)
+        self.assertEqual(warm.iterations, cold.iterations)
+        self.assertAlmostEqual(warm.distance, cold.distance, delta=1e-12)
+
+    def test_malformed_cache_falls_back_to_cold_start(self):
+        A, B = tetra_fixture()
+        cold = distance(A, B)
+        malformed = (
+            WarmStart((), len(A), len(B)),
+            WarmStart(((0,),), len(A), len(B)),
+            WarmStart(((0, 99),), len(A), len(B)),
+            WarmStart(((True, 0),), len(A), len(B)),
+            WarmStart(((0, 0),), True, len(B)),
+        )
+        for cache in malformed:
+            with self.subTest(cache=cache):
+                warm = distance(A, B, warm_start=cache)
+                self.assertEqual(warm.status, cold.status)
+                self.assertEqual(warm.iterations, cold.iterations)
 
 
 # ---------------------------------------------------------------------------

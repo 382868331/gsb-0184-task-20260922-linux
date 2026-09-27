@@ -53,6 +53,18 @@ def main():
     print(f"  separation gap min_A a.n - max_B b.n = {min_a - max_b:.12f} > 0")
     print()
 
+    # --- Case 1b: nearby frame reuses the previous candidate simplex -----
+    moved_cloud = [(x + 0.01, y, z) for x, y, z in cloud]
+    cold_next = distance(cube, moved_cloud)
+    warm_next = distance(cube, moved_cloud, warm_start=res.warm_start)
+    print("=== Case 1b: nearby frame warm start ===")
+    print(f"cold-start iterations : {cold_next.iterations}")
+    print(f"warm-start iterations : {warm_next.iterations}")
+    print(f"warm-start status     : {warm_next.status}, "
+          f"distance: {warm_next.distance:.12f}, "
+          f"residual: {warm_next.residual:.3e}")
+    print()
+
     # --- Case 2: degenerate inputs (dimension reduction, no jitter) -------
     segment = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0)]
     triangle = [(3.0, -1.0, 0.0), (3.0, 1.0, -1.0), (3.0, 1.0, 1.0)]
